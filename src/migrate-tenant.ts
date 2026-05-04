@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ClientConfig } from "pg";
 import { CONFIG } from "./config";
 import { withClient } from "./db";
@@ -26,7 +27,7 @@ function pgFlags(cfg: ClientConfig, database?: string): string {
  *
  * Safely skips COPY data blocks to avoid corrupting row data.
  */
-function rewriteSchemaInDump(sql: string, dbNameEsc: string): string {
+export function rewriteSchemaInDump(sql: string, dbNameEsc: string): string {
   const lines = sql.split("\n");
   const out: string[] = [];
   let inCopy = false;
@@ -54,6 +55,144 @@ function rewriteSchemaInDump(sql: string, dbNameEsc: string): string {
   }
 
   return out.join("\n");
+}
+
+async function writeChunk(stream: fs.WriteStream, chunk: string): Promise<void> {
+  if (!stream.write(chunk)) {
+    await new Promise<void>((resolve, reject) => {
+      const onDrain = () => {
+        stream.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        stream.off("drain", onDrain);
+        reject(err);
+      };
+
+      stream.once("drain", onDrain);
+      stream.once("error", onError);
+    });
+  }
+}
+
+function isCopyStartLine(line: string): boolean {
+  const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
+  return normalized.startsWith("COPY ") && normalized.includes(" FROM stdin;");
+}
+
+function isCopyEndLine(linePrefix: string, lineTooLong: boolean): boolean {
+  return !lineTooLong && (linePrefix === "\\." || linePrefix === "\\.\r");
+}
+
+export async function rewriteSchemaInDumpFile(file: string, dbNameEsc: string): Promise<void> {
+  const tempFile = `${file}.rewrite-${process.pid}-${Date.now()}`;
+  const input = fs.createReadStream(file);
+  const output = fs.createWriteStream(tempFile, { encoding: "utf8", flags: "wx" });
+  const decoder = new StringDecoder("utf8");
+
+  let inCopy = false;
+  let sqlLine = "";
+  let copyLinePrefix = "";
+  let copyLineTooLong = false;
+
+  const resetCopyLine = () => {
+    copyLinePrefix = "";
+    copyLineTooLong = false;
+  };
+
+  const rememberCopyLinePart = (part: string) => {
+    if (copyLineTooLong) return;
+
+    copyLinePrefix += part;
+    if (copyLinePrefix.length > 3) {
+      copyLinePrefix = "";
+      copyLineTooLong = true;
+    }
+  };
+
+  const processSqlLine = async (line: string, newline: string) => {
+    const rewritten = rewriteLine(line, dbNameEsc);
+    await writeChunk(output, rewritten + newline);
+
+    if (isCopyStartLine(line)) {
+      inCopy = true;
+      resetCopyLine();
+    }
+  };
+
+  const processText = async (text: string) => {
+    let offset = 0;
+
+    while (offset < text.length) {
+      if (!inCopy) {
+        const newlineIndex = text.indexOf("\n", offset);
+        if (newlineIndex === -1) {
+          sqlLine += text.slice(offset);
+          break;
+        }
+
+        sqlLine += text.slice(offset, newlineIndex);
+        await processSqlLine(sqlLine, "\n");
+        sqlLine = "";
+        offset = newlineIndex + 1;
+        continue;
+      }
+
+      const newlineIndex = text.indexOf("\n", offset);
+      const end = newlineIndex === -1 ? text.length : newlineIndex + 1;
+      const chunk = text.slice(offset, end);
+      await writeChunk(output, chunk);
+
+      const linePart = newlineIndex === -1 ? chunk : chunk.slice(0, -1);
+      rememberCopyLinePart(linePart);
+
+      if (newlineIndex !== -1) {
+        if (isCopyEndLine(copyLinePrefix, copyLineTooLong)) {
+          inCopy = false;
+        }
+        resetCopyLine();
+      }
+
+      offset = end;
+    }
+  };
+
+  try {
+    for await (const chunk of input) {
+      await processText(decoder.write(chunk as Buffer));
+    }
+
+    const rest = decoder.end();
+    if (rest) {
+      await processText(rest);
+    }
+
+    if (sqlLine) {
+      await processSqlLine(sqlLine, "");
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const onFinish = () => {
+        output.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        output.off("finish", onFinish);
+        reject(err);
+      };
+
+      output.once("finish", onFinish);
+      output.once("error", onError);
+      output.end();
+    });
+
+    await fs.promises.rename(tempFile, file);
+  } catch (err) {
+    input.destroy();
+    output.destroy();
+    await fs.promises.unlink(tempFile).catch(() => undefined);
+    throw err;
+  }
 }
 
 /** Escapes a string for safe use inside a RegExp pattern. */
@@ -102,14 +241,21 @@ function rewriteLine(line: string, dbNameEsc: string): string {
  * Uses try/catch so a permission error (e.g. managed PG restrictions)
  * is logged as a warning and never blocks the migration.
  */
-async function setSourceReadonly(src: ClientConfig, dbName: string, dbNameEsc: string): Promise<void> {
+async function setSourceReadonly(
+  src: ClientConfig,
+  dbName: string,
+  dbNameEsc: string,
+): Promise<void> {
   try {
     await withClient({ ...src, database: dbName }, async (client) => {
       await client.query(`ALTER DATABASE "${dbNameEsc}" SET default_transaction_read_only = true`);
     });
     log("info", `  [${dbName}] source database set to read-only`);
   } catch (err) {
-    log("warn", `  [${dbName}] could not set source to read-only (skipped): ${err instanceof Error ? err.message : String(err)}`);
+    log(
+      "warn",
+      `  [${dbName}] could not set source to read-only (skipped): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -137,14 +283,19 @@ async function dumpWithRewrite(
 
   log("info", `  [${dbName}] dumping public schema...`);
   exec(
-    ["pg_dump", pgFlags(src, dbName), `-n public`, `--no-owner`, `--no-acl`, `-f "${finalDumpFile}"`].join(" "),
+    [
+      "pg_dump",
+      pgFlags(src, dbName),
+      `-n public`,
+      `--no-owner`,
+      `--no-acl`,
+      `-f "${finalDumpFile}"`,
+    ].join(" "),
     srcPw,
   );
 
   log("info", `  [${dbName}] rewriting schema references in dump...`);
-  const rawDump = fs.readFileSync(finalDumpFile, "utf-8");
-  const rewritten = rewriteSchemaInDump(rawDump, dbNameEsc);
-  fs.writeFileSync(finalDumpFile, rewritten, "utf-8");
+  await rewriteSchemaInDumpFile(finalDumpFile, dbNameEsc);
 }
 
 /**
@@ -292,10 +443,7 @@ export async function migrateTenant(dbName: string, sourceOverride?: ClientConfi
     });
 
     // 5. Restore dump into target
-    exec(
-      ["psql", pgFlags(tgt), `-v ON_ERROR_STOP=1`, `-f "${finalDumpFile}"`].join(" "),
-      tgtPw,
-    );
+    exec(["psql", pgFlags(tgt), `-v ON_ERROR_STOP=1`, `-f "${finalDumpFile}"`].join(" "), tgtPw);
 
     log("info", `  [${dbName}] migration completed`);
   } finally {
