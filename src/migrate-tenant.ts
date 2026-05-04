@@ -219,10 +219,16 @@ function rewriteLine(line: string, dbNameEsc: string): string {
   // Schema-qualified names: public.tablename → "dbName".tablename
   result = result.replace(/\bpublic\./g, `"${dbNameEsc}".`);
 
-  // Fix opclass references that should stay in public schema
-  // e.g. "dbName".gin_trgm_ops → public.gin_trgm_ops
+  // Fix opclass references that should stay in public schema.
+  // Handles both quoted ("dbName".gin_trgm_ops) and unquoted (dbName.gin_trgm_ops)
+  // forms — the latter appears in "rename" strategy dumps when search_path is
+  // set to the renamed schema during pg_dump.
   result = result.replace(
     new RegExp(`"${escapeRegex(dbNameEsc)}"\\.gin_trgm_ops`, "g"),
+    "public.gin_trgm_ops",
+  );
+  result = result.replace(
+    new RegExp(`\\b${escapeRegex(dbNameEsc)}\\.gin_trgm_ops\\b`, "g"),
     "public.gin_trgm_ops",
   );
 
@@ -275,12 +281,6 @@ async function dumpWithRewrite(
   srcPw: string,
   finalDumpFile: string,
 ): Promise<void> {
-  // Set source to read-only BEFORE dumping so no new writes can sneak in
-  // between the snapshot and the verification step
-  if (CONFIG.sourceReadonly) {
-    await setSourceReadonly(src, dbName, dbNameEsc);
-  }
-
   log("info", `  [${dbName}] dumping public schema...`);
   exec(
     [
@@ -321,11 +321,6 @@ async function dumpWithRename(
     });
     rollbackNeeded = true;
 
-    // Set source to read-only BEFORE dumping so no new writes can sneak in
-    if (CONFIG.sourceReadonly) {
-      await setSourceReadonly(src, dbName, dbNameEsc);
-    }
-
     log("info", `  [${dbName}] dumping renamed schema...`);
     exec(
       [
@@ -347,13 +342,11 @@ async function dumpWithRename(
     });
     rollbackNeeded = false;
 
-    // Fix opclass references in dump
-    let dumpSql = fs.readFileSync(finalDumpFile, "utf-8");
-    const opclassSchema = `${dbName}.gin_trgm_ops`;
-    if (dumpSql.includes(opclassSchema)) {
-      dumpSql = dumpSql.split(opclassSchema).join("public.gin_trgm_ops");
-    }
-    fs.writeFileSync(finalDumpFile, dumpSql, "utf-8");
+    // Fix opclass references in dump (streaming — avoids OOM on large dumps).
+    // rewriteLine already replaces both "dbNameEsc".gin_trgm_ops and
+    // dbNameEsc.gin_trgm_ops → public.gin_trgm_ops; all other replacements
+    // are no-ops on a rename-strategy dump (no "public." references remain).
+    await rewriteSchemaInDumpFile(finalDumpFile, dbNameEsc);
   } catch (err) {
     if (rollbackNeeded) {
       log("warn", `  [${dbName}] rollback after error...`);
@@ -395,6 +388,9 @@ export async function migrateTenant(dbName: string, sourceOverride?: ClientConfi
     return rows.map((r) => r.extname);
   });
 
+  // Tracks whether we set the source to read-only so we can reset it on failure.
+  let sourceReadonlySet = false;
+
   try {
     // 1. Terminate connections for a consistent dump
     log("info", `  [${dbName}] terminating connections...`);
@@ -421,14 +417,21 @@ export async function migrateTenant(dbName: string, sourceOverride?: ClientConfi
       return;
     }
 
-    // 3. Dump + schema rename (strategy-dependent)
+    // 3. Set source to read-only BEFORE dumping so no new writes can sneak in
+    //    between the snapshot and the verification step.
+    if (CONFIG.sourceReadonly) {
+      await setSourceReadonly(src, dbName, dbNameEsc);
+      sourceReadonlySet = true;
+    }
+
+    // 4. Dump + schema rename (strategy-dependent)
     if (CONFIG.schemaRenameStrategy === "rename") {
       await dumpWithRename(dbName, dbNameEsc, src, srcPw, finalDumpFile);
     } else {
       await dumpWithRewrite(dbName, dbNameEsc, src, srcPw, finalDumpFile);
     }
 
-    // 4. Prepare target DB: drop old schema (if exists), ensure extensions
+    // 5. Prepare target DB: drop old schema (if exists), ensure extensions
     log("info", `  [${dbName}] restoring to target database ${tgt.database}...`);
     await withClient(tgt, async (client) => {
       // await client.query(`DROP SCHEMA IF EXISTS "${dbNameEsc}" CASCADE`);
@@ -442,10 +445,29 @@ export async function migrateTenant(dbName: string, sourceOverride?: ClientConfi
       }
     });
 
-    // 5. Restore dump into target
+    // 6. Restore dump into target
     exec(["psql", pgFlags(tgt), `-v ON_ERROR_STOP=1`, `-f "${finalDumpFile}"`].join(" "), tgtPw);
 
     log("info", `  [${dbName}] migration completed`);
+  } catch (err) {
+    // If we locked the source read-only but migration ultimately failed,
+    // restore write access so the source application keeps working.
+    if (sourceReadonlySet) {
+      try {
+        await withClient({ ...src, database: dbName }, async (client) => {
+          await client.query(
+            `ALTER DATABASE "${dbNameEsc}" RESET default_transaction_read_only`,
+          );
+        });
+        log("info", `  [${dbName}] source database restored to read-write after failure`);
+      } catch (resetErr) {
+        log(
+          "warn",
+          `  [${dbName}] could not restore source to read-write: ${resetErr instanceof Error ? resetErr.message : String(resetErr)}`,
+        );
+      }
+    }
+    throw err;
   } finally {
     // No rollback for "rewrite" strategy — source DB was never modified.
     // Rollback for "rename" strategy is handled inside dumpWithRename.
